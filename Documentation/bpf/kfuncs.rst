@@ -361,3 +361,52 @@ Here is an example of it being used:
 		bpf_task_release(lookup);
 		return 0;
 	}
+
+3.2 struct cgroup * kfuncs
+--------------------------
+
+``struct cgroup *`` objects also have acquire, release, and kptr_get functions:
+
+.. kernel-doc:: kernel/bpf/helpers.c
+   :identifiers: bpf_cgroup_acquire bpf_cgroup_release
+
+.. kernel-doc:: kernel/bpf/helpers.c
+   :identifiers: bpf_cgroup_kptr_get
+
+These kfuncs are used in exactly the same manner as bpf_task_acquire(),
+bpf_task_release(), and bpf_task_kptr_get() respectively, so we won't provide
+examples for them.
+
+Another kfunc available for interacting with ``struct cgroup *`` objects is
+bpf_cgroup_ancestor(). This allows callers to access the ancestor of a cgroup,
+and return it as a cgroup kptr.
+
+.. kernel-doc:: kernel/bpf/helpers.c
+   :identifiers: bpf_cgroup_ancestor
+
+Eventually, BPF should be updated to allow this to happen with a normal memory
+load in the program itself. This is currently not possible without more work in
+the verifier. bpf_cgroup_ancestor() can be used as follows:
+
+.. code-block:: c
+
+	/**
+	 * Simple tracepoint example that illustrates how a cgroup's
+	 * ancestor can be accessed using bpf_cgroup_ancestor().
+	 */
+	SEC("tp_btf/cgroup_mkdir")
+	int BPF_PROG(cgrp_ancestor_example, struct cgroup *cgrp, const char *path)
+	{
+		struct cgroup *parent;
+
+		/* The parent cgroup resides at the level before the current cgroup's level. */
+		parent = bpf_cgroup_ancestor(cgrp, cgrp->level - 1);
+		if (!parent)
+			return -ENOENT;
+
+		bpf_printk("Parent id is %d", parent->self.id);
+
+		/* Return the parent cgroup that was acquired above. */
+		bpf_cgroup_release(parent);
+		return 0;
+	}
