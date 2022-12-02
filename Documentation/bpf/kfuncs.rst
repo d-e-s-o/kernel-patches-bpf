@@ -213,3 +213,151 @@ type. An example is shown below::
                 return register_btf_kfunc_id_set(BPF_PROG_TYPE_TRACING, &bpf_task_kfunc_set);
         }
         late_initcall(init_subsystem);
+
+3. Core kfuncs
+==============
+
+The BPF subsystem provides a number of "core" kfuncs that are potentially
+applicable to a wide variety of different possible use cases and programs.
+Those kfuncs are documented here.
+
+3.1 struct task_struct * kfuncs
+-------------------------------
+
+There are a number of kfuncs that allow ``struct task_struct *`` objects to be
+used as kptrs:
+
+.. kernel-doc:: kernel/bpf/helpers.c
+   :identifiers: bpf_task_acquire bpf_task_release
+
+These kfuncs are useful when you want to acquire or release a reference to a
+``struct task_struct *`` that was passed as e.g. a tracepoint arg, or a
+struct_ops callback arg. For example:
+
+.. code-block:: c
+
+	/**
+	 * A trivial example tracepoint program that shows how to
+	 * acquire and release a struct task_struct * pointer.
+	 */
+	SEC("tp_btf/task_newtask")
+	int BPF_PROG(task_acquire_release_example, struct task_struct *task, u64 clone_flags)
+	{
+		struct task_struct *acquired;
+
+		acquired = bpf_task_acquire(task);
+
+		/*
+		 * In a typical program you'd do something like store
+		 * the task in a map. Here, we just release it.
+		 */
+		bpf_task_release(acquired);
+		return 0;
+	}
+
+If you want to acquire a reference to a ``struct task_struct`` kptr that's
+already stored in a map, you can use bpf_task_kptr_get():
+
+.. kernel-doc:: kernel/bpf/helpers.c
+   :identifiers: bpf_task_kptr_get
+
+Here's an example of how it can be used:
+
+.. code-block:: c
+
+	/* struct containing the struct task_struct kptr which is actually stored in the map. */
+	struct __tasks_kfunc_map_value {
+		struct task_struct __kptr_ref * task;
+	};
+
+	/* The map containing struct __tasks_kfunc_map_value entries. */
+	struct hash_map {
+		__uint(type, BPF_MAP_TYPE_HASH);
+		__type(key, int);
+		__type(value, struct __tasks_kfunc_map_value);
+		__uint(max_entries, 1);
+	} __tasks_kfunc_map SEC(".maps");
+
+	/* ... */
+
+	/**
+	 * A simple example tracepoint program showing how a
+	 * struct task_struct kptr that is stored in a map can
+	 * be acquired using the bpf_task_kptr_get() kfunc.
+	 */
+	 SEC("tp_btf/task_newtask")
+	 int BPF_PROG(task_kptr_get_example, struct task_struct *task, u64 clone_flags)
+	 {
+		struct task_struct *kptr;
+		struct __tasks_kfunc_map_value *v;
+		s32 pid;
+		long status;
+
+		status = bpf_probe_read_kernel(&pid, sizeof(pid), &task->pid);
+		if (status)
+			return status;
+
+		/* Assume a task kptr was previously stored in the map. */
+		v = bpf_map_lookup_elem(&__tasks_kfunc_map, &pid);
+		if (!v)
+			return -ENOENT;
+
+		/* Acquire a reference to the task kptr that's already stored in the map. */
+		kptr = bpf_task_kptr_get(&v->task);
+		if (!kptr)
+			/* If no task was present in the map, it's because
+			 * we're racing with another CPU that removed it with
+			 * bpf_kptr_xchg() between the bpf_map_lookup_elem()
+			 * above, and our call to bpf_task_kptr_get().
+			 * bpf_task_kptr_get() internally safely handles this
+			 * race, and will return NULL if the task is no longer
+			 * present in the map by the time we invoke the kfunc.
+			 */
+			return -EBUSY;
+
+		/* Free the reference we just took above. Note that the
+		 * original struct task_struct kptr is still in the map.
+		 * It will be freed either at a later time if another
+		 * context deletes it from the map, or automatically by
+		 * the BPF subsystem if it's still present when the map
+		 * is destroyed.
+		 */
+		bpf_task_release(kptr);
+
+		return 0;
+        }
+
+Finally, a BPF program can also look up a task from a pid. This can be useful
+if the caller doesn't have a trusted pointer to a ``struct task_struct *``
+object that it can acquire a reference on with bpf_task_acquire().
+
+.. kernel-doc:: kernel/bpf/helpers.c
+   :identifiers: bpf_task_from_pid
+
+Here is an example of it being used:
+
+.. code-block:: c
+
+	SEC("tp_btf/task_newtask")
+	int BPF_PROG(task_get_pid_example, struct task_struct *task, u64 clone_flags)
+	{
+		struct task_struct *lookup;
+
+		lookup = bpf_task_from_pid(task->pid);
+		if (!lookup)
+			/* A task should always be found, as %task is a tracepoint arg. */
+			return -ENOENT;
+
+		if (lookup->pid != task->pid) {
+			/* The pid of the lookup task should be the same as the input task. */
+			bpf_task_release(lookup);
+			return -EINVAL;
+		}
+
+		/* bpf_task_from_pid() returns an acquired reference,
+		 * so it must be dropped before returning from the
+		 * tracepoint handler.
+		 */
+		bpf_task_release(lookup);
+		return 0;
+	}
